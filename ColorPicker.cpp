@@ -43,6 +43,10 @@ HWND g_hMagnifier = nullptr;
 HWND g_hMaskOverlay = nullptr;
 HWND g_hMainWnd = nullptr;
 
+HWND g_hEditHex = nullptr;
+HWND g_hEditDec = nullptr;
+bool g_isUpdatingEditBoxes = false;
+
 const int MAG_SIZE = 90;
 const int MAG_PIXELS = 9;
 const int CELL_SIZE = MAG_SIZE / MAG_PIXELS;
@@ -60,7 +64,6 @@ bool hoverCopyDec = false;
 bool hoverPick = false;
 wstring statusMsg = L"点击左侧面板或输入颜色";
 
-// 标题栏常量
 const int TITLE_H = 36;
 bool hoverClose = false;
 bool hoverMin = false;
@@ -68,7 +71,6 @@ bool isDraggingWindow = false;
 POINT ptDragStart = { 0, 0 };
 RECT rectWindowStart = { 0, 0 };
 
-// ====== 精调布局常量 ======
 const int WIN_W = 700, WIN_H = 430;
 const int LEFT_X = 30, LEFT_Y = 70, CARD_W = 320, CARD_H = 370;
 const int SV_X = 50, SV_Y = 90, SV_W = 280, SV_H = 180;
@@ -79,7 +81,42 @@ const int TEXT_DEC_Y = 375;
 const int INPUT2_Y = 395;
 const int BTN_COPY_X = 245, BTN_COPY_W = 60, BTN_COPY_H = 30;
 
-// 辅助函数：绘制圆角矩形
+// 拖动实时数字只重绘输入框中间的文字区域，完全不触碰边框和四个圆角。
+const int LIVE_TEXT_X = 90;
+const int LIVE_TEXT_W = 100;
+const int LIVE_TEXT_TOP = 6;
+const int LIVE_TEXT_H = 14;
+
+// ====== 缓存的 GDI / GDI+ 资源 ======
+// 每帧重建字体和图标不仅慢，图标不释放还会在长时间拖动后耗尽 USER/GDI 句柄，
+// 导致父窗口 CreateCompatibleBitmap 失败、整窗变黑。这些资源只创建一次。
+HICON g_hIcon20 = NULL;
+HICON g_hIcon28 = NULL;
+HFONT g_hEditFont = NULL;
+HBRUSH g_hEditBgBrush = NULL;
+
+HDC g_hdcBack = NULL;
+HBITMAP g_hbmBack = NULL;
+HGDIOBJ g_hOldBackBmp = NULL;
+int g_backW = 0;
+int g_backH = 0;
+
+struct UIFonts {
+    Font* titleBar;
+    Font* main;
+    Font* bigTitle;
+    Font* rgb;
+    Font* pickBtn;
+    Font* status;
+};
+UIFonts g_fonts = {};
+
+// 拖动调色期间为 true：两个 EDIT 被隐藏，实时数值由父窗口双缓冲绘制。
+bool g_showLiveValues = false;
+
+// 色板/色相条按下时的起点，用于区分“点击”和“拖动”。
+POINT g_colorDragStart = { 0, 0 };
+
 void DrawRoundRect(Graphics& g, Brush* brush, Pen* pen, Rect rect, int radius) {
     GraphicsPath path;
     int d = radius * 2;
@@ -90,6 +127,91 @@ void DrawRoundRect(Graphics& g, Brush* brush, Pen* pen, Rect rect, int radius) {
     path.CloseFigure();
     if (brush) g.FillPath(brush, &path);
     if (pen) g.DrawPath(pen, &path);
+}
+
+void EnsureUIFonts() {
+    if (!g_fonts.titleBar) g_fonts.titleBar = new Font(L"Microsoft YaHei", 14, FontStyleRegular, UnitPixel);
+    if (!g_fonts.main) g_fonts.main = new Font(L"Microsoft YaHei", 12, FontStyleRegular, UnitPixel);
+    if (!g_fonts.bigTitle) g_fonts.bigTitle = new Font(L"Microsoft YaHei", 18, FontStyleBold, UnitPixel);
+    if (!g_fonts.rgb) g_fonts.rgb = new Font(L"Consolas", 14, FontStyleBold, UnitPixel);
+    if (!g_fonts.pickBtn) g_fonts.pickBtn = new Font(L"Microsoft YaHei", 14, FontStyleBold, UnitPixel);
+    if (!g_fonts.status) g_fonts.status = new Font(L"Microsoft YaHei", 12, FontStyleRegular, UnitPixel);
+}
+
+void ReleaseUIFonts() {
+    delete g_fonts.titleBar; g_fonts.titleBar = nullptr;
+    delete g_fonts.main; g_fonts.main = nullptr;
+    delete g_fonts.bigTitle; g_fonts.bigTitle = nullptr;
+    delete g_fonts.rgb; g_fonts.rgb = nullptr;
+    delete g_fonts.pickBtn; g_fonts.pickBtn = nullptr;
+    delete g_fonts.status; g_fonts.status = nullptr;
+}
+
+void ReleaseBackBuffer() {
+    if (g_hdcBack) {
+        if (g_hOldBackBmp) SelectObject(g_hdcBack, g_hOldBackBmp);
+        if (g_hbmBack) DeleteObject(g_hbmBack);
+        DeleteDC(g_hdcBack);
+    }
+    g_hdcBack = NULL;
+    g_hbmBack = NULL;
+    g_hOldBackBmp = NULL;
+    g_backW = 0;
+    g_backH = 0;
+}
+
+// 返回 false 表示后台缓冲创建失败，调用方应退回直接绘制。
+bool EnsureBackBuffer(HDC hdcRef, int w, int h, bool& recreated) {
+    recreated = false;
+    if (g_hdcBack && g_backW == w && g_backH == h) return true;
+
+    ReleaseBackBuffer();
+
+    HDC hdcMem = CreateCompatibleDC(hdcRef);
+    if (!hdcMem) return false;
+    HBITMAP hbmMem = CreateCompatibleBitmap(hdcRef, w, h);
+    if (!hbmMem) {
+        DeleteDC(hdcMem);
+        return false;
+    }
+
+    HGDIOBJ hOld = SelectObject(hdcMem, hbmMem);
+    g_hdcBack = hdcMem;
+    g_hbmBack = hbmMem;
+    g_hOldBackBmp = hOld;
+    g_backW = w;
+    g_backH = h;
+    recreated = true;
+    return true;
+}
+
+// 拖动调色时只让真正变化的区域失效，避免每次整窗重绘造成的卡顿。
+void InvalidateColorPreview(HWND hwnd) {
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    int w = rc.right;
+
+    RECT rSV = { SV_X - 12, SV_Y - 12, SV_X + SV_W + 12, SV_Y + SV_H + 12 };
+    InvalidateRect(hwnd, &rSV, FALSE);
+
+    RECT rHue = { HUE_X - 12, HUE_Y - 12, HUE_X + HUE_W + 12, HUE_Y + HUE_H + 12 };
+    InvalidateRect(hwnd, &rHue, FALSE);
+
+    int rightCenterX = LEFT_X + CARD_W + (w - (LEFT_X + CARD_W)) / 2;
+    int yOffset = 30;
+    int rightCardW = 290;
+    int rightCardX = rightCenterX - rightCardW / 2;
+    RECT rCard = { rightCardX - 2, 85 + yOffset - 2, rightCardX + rightCardW + 2, 85 + yOffset + 195 + 2 };
+    InvalidateRect(hwnd, &rCard, FALSE);
+
+    if (g_showLiveValues) {
+        RECT rText1 = { LIVE_TEXT_X, INPUT1_Y + LIVE_TEXT_TOP,
+                        LIVE_TEXT_X + LIVE_TEXT_W, INPUT1_Y + LIVE_TEXT_TOP + LIVE_TEXT_H };
+        RECT rText2 = { LIVE_TEXT_X, INPUT2_Y + LIVE_TEXT_TOP,
+                        LIVE_TEXT_X + LIVE_TEXT_W, INPUT2_Y + LIVE_TEXT_TOP + LIVE_TEXT_H };
+        InvalidateRect(hwnd, &rText1, FALSE);
+        InvalidateRect(hwnd, &rText2, FALSE);
+    }
 }
 
 void UpdateColorFromHSV() {
@@ -130,6 +252,52 @@ wstring GetHexStr(int r, int g, int b) {
 wstring GetDecStr(int r, int g, int b) {
     unsigned long argb = (0xFFul << 24) | ((unsigned long)r << 16) | ((unsigned long)g << 8) | (unsigned long)b;
     wchar_t buf[32]; wsprintfW(buf, L"%lu", argb); return buf;
+}
+
+// 只有文本真正变化时才调用 SetWindowTextW，避免多余的子控件重绘。
+static void SetEditTextIfChanged(HWND hEdit, const wstring& text) {
+    wchar_t buf[64];
+    GetWindowTextW(hEdit, buf, 64);
+    if (text != buf) SetWindowTextW(hEdit, text.c_str());
+}
+
+// forceBoth = true 用于拖动/取色过程：此时鼠标已被主窗口捕获，
+// 不存在用户正在输入的情况，两个输入框都应强制同步。
+void UpdateEditBoxes(bool forceBoth = false) {
+    if (!g_hEditHex || !g_hEditDec || g_isUpdatingEditBoxes) return;
+    g_isUpdatingEditBoxes = true;
+    wstring hex = GetHexStr(currentR, currentG, currentB);
+    wstring dec = GetDecStr(currentR, currentG, currentB);
+    if (forceBoth || GetFocus() != g_hEditHex) SetEditTextIfChanged(g_hEditHex, hex);
+    if (forceBoth || GetFocus() != g_hEditDec) SetEditTextIfChanged(g_hEditDec, dec);
+    g_isUpdatingEditBoxes = false;
+}
+
+// 拖动调色时隐藏两个 EDIT，改由父窗口双缓冲绘制实时数值。
+// 这样数值和色板标记在同一帧更新，不会被 EDIT 子窗口的 WM_PAINT 拖延。
+void SetLiveValueMode(bool on) {
+    if (g_showLiveValues == on) return;
+    g_showLiveValues = on;
+
+    if (on) {
+        ShowWindow(g_hEditHex, SW_HIDE);
+        ShowWindow(g_hEditDec, SW_HIDE);
+    }
+    else {
+        UpdateEditBoxes(true);
+        ShowWindow(g_hEditHex, SW_SHOW);
+        ShowWindow(g_hEditDec, SW_SHOW);
+    }
+
+    if (on) {
+        // 只失效中间的文字区域；边框和四个圆角保持原样，不重绘。
+        RECT rText1 = { LIVE_TEXT_X, INPUT1_Y + LIVE_TEXT_TOP,
+                        LIVE_TEXT_X + LIVE_TEXT_W, INPUT1_Y + LIVE_TEXT_TOP + LIVE_TEXT_H };
+        RECT rText2 = { LIVE_TEXT_X, INPUT2_Y + LIVE_TEXT_TOP,
+                        LIVE_TEXT_X + LIVE_TEXT_W, INPUT2_Y + LIVE_TEXT_TOP + LIVE_TEXT_H };
+        InvalidateRect(g_hMainWnd, &rText1, FALSE);
+        InvalidateRect(g_hMainWnd, &rText2, FALSE);
+    }
 }
 
 void CopyToClipboard(HWND hwnd, const wstring& text) {
@@ -321,23 +489,20 @@ void ExitPickingMode(HWND hwnd) {
     SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOSENDCHANGING);
 }
 
-// ================= UI 绘制模块 =================
 void DrawTitleBar(Graphics& g, int w) {
     SolidBrush titleBg(Color(255, 15, 15, 25));
     g.FillRectangle(&titleBg, 0, 0, w + 2, TITLE_H + 1);
 
-    Font fontTitleBar(L"Microsoft YaHei", 14, FontStyleRegular, UnitPixel);
+    Font* fontTitleBar = g_fonts.titleBar;
     SolidBrush titleTextBrush(Color(255, 200, 200, 210));
 
-    // 直接使用系统图标，不需要外部图片
-    HICON hIcon = (HICON)LoadImage(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_ICON1), IMAGE_ICON, 20, 20, LR_DEFAULTCOLOR);
-    if (hIcon) {
+    if (g_hIcon20) {
         HDC hdc = g.GetHDC();
-        DrawIconEx(hdc, 12, 10, hIcon, 20, 20, 0, NULL, DI_NORMAL);
+        DrawIconEx(hdc, 12, 10, g_hIcon20, 20, 20, 0, NULL, DI_NORMAL);
         g.ReleaseHDC(hdc);
     }
 
-    g.DrawString(L"取色器", -1, &fontTitleBar, PointF(34, 10), &titleTextBrush);
+    g.DrawString(L"取色器", -1, fontTitleBar, PointF(34, 10), &titleTextBrush);
 
     if (hoverMin) {
         SolidBrush hBrush(Color(255, 40, 40, 50));
@@ -389,24 +554,48 @@ void DrawLeftPanel(Graphics& g, int w) {
     int hx = HUE_X + (int)((currentH / 360.0f) * HUE_W);
     g.DrawEllipse(&penWhite, hx - 8, HUE_Y + HUE_H / 2 - 8, 16, 16);
 
-    Font fontMain(L"Microsoft YaHei", 12, FontStyleRegular, UnitPixel);
+    Font* fontMain = g_fonts.main;
     SolidBrush subText(Color(255, 171, 175, 208));
-    g.DrawString(L"十六进制(RGB):", 9, &fontMain, PointF(50, (REAL)TEXT_HEX_Y), &subText);
-    g.DrawString(L"十进制(ARGB):", 9, &fontMain, PointF(50, (REAL)TEXT_DEC_Y), &subText);
+    g.DrawString(L"十六进制(RGB):", 9, fontMain, PointF(50, (REAL)TEXT_HEX_Y), &subText);
+    g.DrawString(L"十进制(ARGB):", 9, fontMain, PointF(50, (REAL)TEXT_DEC_Y), &subText);
 
     SolidBrush inputBg(Color(255, 55, 55, 75));
     Pen inputPen(Color(255, 100, 100, 120), 1.0f);
     DrawRoundRect(g, &inputBg, &inputPen, Rect(50, INPUT1_Y, 180, 30), 8);
     DrawRoundRect(g, &inputBg, &inputPen, Rect(50, INPUT2_Y, 180, 30), 8);
 
-    Font fontMono(L"Consolas", 14, FontStyleBold, UnitPixel);
-    if (isPicking) {
-        g.DrawString(GetHexStr(previewR, previewG, previewB).c_str(), 7, &fontMono, PointF(65, (REAL)(INPUT1_Y + 5)), &textBrush);
-        g.DrawString(GetDecStr(previewR, previewG, previewB).c_str(), -1, &fontMono, PointF(65, (REAL)(INPUT2_Y + 5)), &textBrush);
-    }
-    else {
-        g.DrawString(GetHexStr(currentR, currentG, currentB).c_str(), 7, &fontMono, PointF(65, (REAL)(INPUT1_Y + 5)), &textBrush);
-        g.DrawString(GetDecStr(currentR, currentG, currentB).c_str(), -1, &fontMono, PointF(65, (REAL)(INPUT2_Y + 5)), &textBrush);
+    if (g_showLiveValues) {
+        // 和 EDIT 控件使用同一个 HFONT、同一个矩形和同样的颜色绘制，
+        // 这样拖动中和松手后的字体、字号、居中位置保持一致。
+        wstring hexValue = GetHexStr(currentR, currentG, currentB);
+        wstring decValue = GetDecStr(currentR, currentG, currentB);
+
+        HDC hdc = g.GetHDC();
+        HGDIOBJ hOldFont = SelectObject(hdc, g_hEditFont);
+        SetBkMode(hdc, OPAQUE);
+        SetBkColor(hdc, RGB(55, 55, 75));
+        SetTextColor(hdc, RGB(240, 240, 250));
+
+        // EDIT 位于 INPUT_Y+4，它的内部文字比 DrawText 的 DT_VCENTER 高 4px，
+        // 因此实时文字矩形从 INPUT_Y 开始，两者文字行才能对齐。
+        RECT rcHex = { 53, INPUT1_Y, 53 + 174, INPUT1_Y + 24 };
+        RECT rcDec = { 53, INPUT2_Y, 53 + 174, INPUT2_Y + 24 };
+
+        // 只允许在中间文字区域绘制：OPAQUE 背景和文字都不会碰到边框/四个圆角。
+        int saved = SaveDC(hdc);
+        IntersectClipRect(hdc, LIVE_TEXT_X, INPUT1_Y + LIVE_TEXT_TOP,
+            LIVE_TEXT_X + LIVE_TEXT_W, INPUT1_Y + LIVE_TEXT_TOP + LIVE_TEXT_H);
+        DrawTextW(hdc, hexValue.c_str(), -1, &rcHex, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        RestoreDC(hdc, saved);
+
+        saved = SaveDC(hdc);
+        IntersectClipRect(hdc, LIVE_TEXT_X, INPUT2_Y + LIVE_TEXT_TOP,
+            LIVE_TEXT_X + LIVE_TEXT_W, INPUT2_Y + LIVE_TEXT_TOP + LIVE_TEXT_H);
+        DrawTextW(hdc, decValue.c_str(), -1, &rcDec, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        RestoreDC(hdc, saved);
+
+        SelectObject(hdc, hOldFont);
+        g.ReleaseHDC(hdc);
     }
 
     SolidBrush btnBgHex(hoverCopyHex ? Color(255, 80, 80, 110) : Color(255, 55, 55, 75));
@@ -418,8 +607,8 @@ void DrawLeftPanel(Graphics& g, int w) {
     StringFormat sf;
     sf.SetAlignment(StringAlignmentCenter);
     sf.SetLineAlignment(StringAlignmentCenter);
-    g.DrawString(L"拷贝", 2, &fontMain, RectF((REAL)BTN_COPY_X, (REAL)INPUT1_Y, (REAL)BTN_COPY_W, (REAL)BTN_COPY_H), &sf, &textBrush);
-    g.DrawString(L"拷贝", 2, &fontMain, RectF((REAL)BTN_COPY_X, (REAL)INPUT2_Y, (REAL)BTN_COPY_W, (REAL)BTN_COPY_H), &sf, &textBrush);
+    g.DrawString(L"拷贝", 2, fontMain, RectF((REAL)BTN_COPY_X, (REAL)INPUT1_Y, (REAL)BTN_COPY_W, (REAL)BTN_COPY_H), &sf, &textBrush);
+    g.DrawString(L"拷贝", 2, fontMain, RectF((REAL)BTN_COPY_X, (REAL)INPUT2_Y, (REAL)BTN_COPY_W, (REAL)BTN_COPY_H), &sf, &textBrush);
 }
 
 void DrawRightPanel(Graphics& g, int w, int h) {
@@ -430,17 +619,15 @@ void DrawRightPanel(Graphics& g, int w, int h) {
     int titleAreaX = rightCenterX + 116;
     int titleAreaY = h - 60;
 
-    // 同样使用系统图标
-    HICON hIcon = (HICON)LoadImage(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_ICON1), IMAGE_ICON, 28, 28, LR_DEFAULTCOLOR);
-    if (hIcon) {
+    if (g_hIcon28) {
         HDC hdc = g.GetHDC();
-        DrawIconEx(hdc, titleAreaX - 30, titleAreaY+25, hIcon, 28, 28, 0, NULL, DI_NORMAL);
+        DrawIconEx(hdc, titleAreaX - 30, titleAreaY + 25, g_hIcon28, 28, 28, 0, NULL, DI_NORMAL);
         g.ReleaseHDC(hdc);
     }
 
-    Font fontBigTitle(L"Microsoft YaHei", 18, FontStyleBold, UnitPixel);
+    Font* fontBigTitle = g_fonts.bigTitle;
     SolidBrush bottomTitleBrush(Color(255, 150, 180, 255));
-    g.DrawString(L"取色器", 5, &fontBigTitle, PointF((REAL)(titleAreaX), (REAL)titleAreaY+25), &bottomTitleBrush);
+    g.DrawString(L"取色器", 5, fontBigTitle, PointF((REAL)(titleAreaX), (REAL)titleAreaY + 25), &bottomTitleBrush);
 
     int yOffset = 30;
     int rightCardW = 290;
@@ -458,7 +645,7 @@ void DrawRightPanel(Graphics& g, int w, int h) {
 
     wchar_t rgbStr[64];
     wsprintfW(rgbStr, L"RGB(%d, %d, %d)", displayR, displayG, displayB);
-    Font fontRgb(L"Consolas", 14, FontStyleBold, UnitPixel);
+    Font* fontRgb = g_fonts.rgb;
     SolidBrush rgbBg(Color(255, 55, 55, 75));
     Pen inputPen(Color(255, 100, 100, 120), 1.0f);
     int rgbW = 230, rgbX = rightCenterX - rgbW / 2;
@@ -467,23 +654,66 @@ void DrawRightPanel(Graphics& g, int w, int h) {
     StringFormat sf;
     sf.SetAlignment(StringAlignmentCenter);
     sf.SetLineAlignment(StringAlignmentCenter);
-    g.DrawString(rgbStr, -1, &fontRgb, RectF((REAL)rgbX, (REAL)(225 + yOffset), (REAL)rgbW, 40), &sf, &textBrush);
+    g.DrawString(rgbStr, -1, fontRgb, RectF((REAL)rgbX, (REAL)(225 + yOffset), (REAL)rgbW, 40), &sf, &textBrush);
 
-    Font fontPickBtn(L"Microsoft YaHei", 14, FontStyleBold, UnitPixel);
+    Font* fontPickBtn = g_fonts.pickBtn;
     SolidBrush accent(hoverPick ? Color(255, 100, 110, 255) : Color(255, 79, 91, 255));
     int pickW = 290, pickX = rightCenterX - pickW / 2;
     DrawRoundRect(g, &accent, nullptr, Rect(pickX, 305 + yOffset, pickW, 50), 12);
-    g.DrawString(L"屏幕取色", 8, &fontPickBtn, RectF((REAL)pickX + 11, (REAL)(305 + yOffset), (REAL)pickW, 50), &sf, &textBrush);
+    g.DrawString(L"屏幕取色", 8, fontPickBtn, RectF((REAL)pickX + 11, (REAL)(305 + yOffset), (REAL)pickW, 50), &sf, &textBrush);
 
-    Font fontStatus(L"Microsoft YaHei", 12, FontStyleRegular, UnitPixel);
+    Font* fontStatus = g_fonts.status;
     SolidBrush subText(Color(255, 171, 175, 208));
-    g.DrawString(statusMsg.c_str(), -1, &fontStatus, RectF((REAL)(rightCenterX - 150), 390.0f, 300.0f, 30.0f), &sf, &subText);
+    g.DrawString(statusMsg.c_str(), -1, fontStatus, RectF((REAL)(rightCenterX - 150), 390.0f, 300.0f, 30.0f), &sf, &subText);
+}
+
+void ParseHexInput() {
+    wchar_t buf[64];
+    GetWindowTextW(g_hEditHex, buf, 64);
+    wstring str(buf);
+    if (str.empty() || str[0] != L'#' || str.length() != 7) return;
+
+    try {
+        int r = std::stoi(str.substr(1, 2), nullptr, 16);
+        int g = std::stoi(str.substr(3, 2), nullptr, 16);
+        int b = std::stoi(str.substr(5, 2), nullptr, 16);
+        currentR = r; currentG = g; currentB = b;
+        UpdateHSVFromColor(currentR, currentG, currentB);
+        UpdateEditBoxes();              // 同步十进制框（当前获得焦点的十六进制框会被跳过）
+        InvalidateColorPreview(g_hMainWnd);
+    }
+    catch (...) {}
+}
+
+void ParseDecInput() {
+    wchar_t buf[64];
+    GetWindowTextW(g_hEditDec, buf, 64);
+    wstring str(buf);
+    if (str.empty()) return;
+
+    try {
+        unsigned long argb = std::stoul(str);
+        currentR = (argb >> 16) & 0xFF;
+        currentG = (argb >> 8) & 0xFF;
+        currentB = argb & 0xFF;
+        UpdateHSVFromColor(currentR, currentG, currentB);
+        UpdateEditBoxes();              // 同步十六进制框（当前获得焦点的十进制框会被跳过）
+        InvalidateColorPreview(g_hMainWnd);
+    }
+    catch (...) {}
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
         g_hMainWnd = hwnd;
+
+        // 一次性创建所有会复用的资源（图标、字体、输入框画刷），避免每帧创建/泄漏。
+        EnsureUIFonts();
+        g_hIcon20 = (HICON)LoadImage(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_ICON1), IMAGE_ICON, 20, 20, LR_DEFAULTCOLOR);
+        g_hIcon28 = (HICON)LoadImage(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_ICON1), IMAGE_ICON, 28, 28, LR_DEFAULTCOLOR);
+        g_hEditBgBrush = CreateSolidBrush(RGB(55, 55, 75));
+
         HICON hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_ICON1));
         if (hIcon) {
             SendMessage(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
@@ -517,6 +747,44 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_hMaskOverlay = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
             L"MaskOverlayClass", L"", WS_POPUP, 0, 0, 100, 100, NULL, NULL, GetModuleHandle(NULL), NULL);
         SetLayeredWindowAttributes(g_hMaskOverlay, 0, 1, LWA_ALPHA);
+
+        g_hEditHex = CreateWindowExW(0, L"EDIT", L"#FF0000",
+            WS_CHILD | WS_VISIBLE | ES_LEFT | ES_AUTOHSCROLL | ES_CENTER,
+            53, INPUT1_Y + 4, 174, 24, hwnd, (HMENU)1001, GetModuleHandle(NULL), NULL);
+
+        g_hEditDec = CreateWindowExW(0, L"EDIT", L"0",
+            WS_CHILD | WS_VISIBLE | ES_LEFT | ES_AUTOHSCROLL | ES_CENTER,
+            53, INPUT2_Y + 4, 174, 24, hwnd, (HMENU)1002, GetModuleHandle(NULL), NULL);
+
+        g_hEditFont = CreateFontW(16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Consolas");
+        SendMessage(g_hEditHex, WM_SETFONT, (WPARAM)g_hEditFont, TRUE);
+        SendMessage(g_hEditDec, WM_SETFONT, (WPARAM)g_hEditFont, TRUE);
+        SendMessage(g_hEditHex, EM_SETLIMITTEXT, 7, 0);
+        SendMessage(g_hEditDec, EM_SETLIMITTEXT, 10, 0);
+
+        UpdateEditBoxes();
+        return 0;
+    }
+
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = (HDC)wParam;
+        SetTextColor(hdc, RGB(240, 240, 250));
+        SetBkColor(hdc, RGB(55, 55, 75));
+        return (LRESULT)(g_hEditBgBrush ? g_hEditBgBrush : (HBRUSH)GetStockObject(BLACK_BRUSH));
+    }
+
+    case WM_COMMAND: {
+        int wmId = LOWORD(wParam);
+        int wmEvent = HIWORD(wParam);
+
+        if (wmEvent == EN_CHANGE && !g_isUpdatingEditBoxes) {
+            if (wmId == 1001) ParseHexInput();
+            else if (wmId == 1002) ParseDecInput();
+        }
+        else if (wmEvent == EN_KILLFOCUS) {
+            UpdateEditBoxes();
+        }
         return 0;
     }
 
@@ -560,6 +828,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         DeleteDC(g_hdcSnapshot);
                         g_hbmScreen = NULL; g_pScreenBits = NULL;
                     }
+                    UpdateEditBoxes(true); // 取色成功强制同步两个输入框
                     InvalidateRect(hwnd, NULL, FALSE);
                     return 0;
                 }
@@ -618,24 +887,50 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int w = rc.right - rc.left;
         int h = rc.bottom - rc.top;
 
-        HDC hdcMem = CreateCompatibleDC(hdc);
-        HBITMAP hbmMem = CreateCompatibleBitmap(hdc, w, h);
-        HGDIOBJ hOld = SelectObject(hdcMem, hbmMem);
+        EnsureUIFonts();
 
-        Graphics g(hdcMem);
+        bool recreated = false;
+        if (!EnsureBackBuffer(hdc, w, h, recreated)) {
+            // 极端情况下（GDI 资源不足）退回直接绘制，至少不会整窗变黑。
+            Graphics gDirect(hdc);
+            gDirect.SetSmoothingMode(SmoothingModeAntiAlias);
+            SolidBrush bgBrush(Color(255, 35, 35, 50));
+            gDirect.FillRectangle(&bgBrush, 0, 0, w, h);
+            DrawTitleBar(gDirect, w);
+            DrawLeftPanel(gDirect, w);
+            DrawRightPanel(gDirect, w, h);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        // 后台缓冲是复用的；先清掉可能残留的 DC 裁剪区，避免上一帧的 clip 影响本次重绘。
+        SelectClipRgn(g_hdcBack, NULL);
+        Graphics g(g_hdcBack);
         g.SetSmoothingMode(SmoothingModeAntiAlias);
+
+        // 只重绘本次真正失效的区域，其余像素沿用后台缓冲中的上一帧内容。
+        // 第一次创建缓冲、或尺寸变化时必须整窗重绘。
+        HRGN hClip = CreateRectRgn(0, 0, 0, 0);
+        int clipType = GetClipRgn(hdc, hClip);
+        if (recreated || clipType != 1) {
+            g.ResetClip();
+        }
+        else {
+            g.SetClip(hClip, CombineModeReplace);
+        }
+        DeleteObject(hClip);
 
         SolidBrush bgBrush(Color(255, 35, 35, 50));
         g.FillRectangle(&bgBrush, 0, 0, w, h);
-
         DrawTitleBar(g, w);
         DrawLeftPanel(g, w);
         DrawRightPanel(g, w, h);
 
-        BitBlt(hdc, 0, 0, w, h, hdcMem, 0, 0, SRCCOPY);
-        SelectObject(hdcMem, hOld);
-        DeleteObject(hbmMem);
-        DeleteDC(hdcMem);
+        RECT blt = recreated ? rc : ps.rcPaint;
+        if (blt.right > blt.left && blt.bottom > blt.top) {
+            BitBlt(hdc, blt.left, blt.top, blt.right - blt.left, blt.bottom - blt.top,
+                g_hdcBack, blt.left, blt.top, SRCCOPY);
+        }
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -666,13 +961,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int relY = max(0, min(SV_H, y - SV_Y));
             currentS = (int)(((float)relX / SV_W) * 255.0f);
             currentV = (int)((1.0f - (float)relY / SV_H) * 255.0f);
-            UpdateColorFromHSV(); InvalidateRect(hwnd, NULL, FALSE);
+            UpdateColorFromHSV();
+            if (!g_showLiveValues) {
+                // 移动超过 3px 才算拖动，才切换到父窗口实时绘制；
+                // 单纯点击时保持 EDIT 显示，避免四个圆角反复切换。
+                int moved = abs(x - g_colorDragStart.x) + abs(y - g_colorDragStart.y);
+                if (moved >= 3) {
+                    SetLiveValueMode(true);
+                }
+                else {
+                    UpdateEditBoxes(true);
+                }
+            }
+            // 数值由父窗口在 DrawLeftPanel 里和色板同一帧绘制，不再等 EDIT 重绘。
+            InvalidateColorPreview(hwnd);
         }
         else if (dragHue) {
             int relX = max(0, min(HUE_W, x - HUE_X));
             currentH = (int)(((float)relX / HUE_W) * 360.0f);
             if (currentH >= 360) currentH = 359;
-            UpdateColorFromHSV(); InvalidateRect(hwnd, NULL, FALSE);
+            UpdateColorFromHSV();
+            if (!g_showLiveValues) {
+                int moved = abs(x - g_colorDragStart.x) + abs(y - g_colorDragStart.y);
+                if (moved >= 3) {
+                    SetLiveValueMode(true);
+                }
+                else {
+                    UpdateEditBoxes(true);
+                }
+            }
+            InvalidateColorPreview(hwnd);
         }
         else {
             int rightCenterX = LEFT_X + CARD_W + (w - (LEFT_X + CARD_W)) / 2;
@@ -710,18 +1028,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         if (x >= SV_X && x <= SV_X + SV_W && y >= SV_Y && y <= SV_Y + SV_H) {
             dragSV = true; SetCapture(hwnd);
+            // 让输入框失焦，避免光标/选中状态干扰拖动过程中的数值刷新。
+            SetFocus(hwnd);
+            g_colorDragStart.x = x;
+            g_colorDragStart.y = y;
             int relX = max(0, min(SV_W, x - SV_X));
             int relY = max(0, min(SV_H, y - SV_Y));
             currentS = (int)(((float)relX / SV_W) * 255.0f);
             currentV = (int)((1.0f - (float)relY / SV_H) * 255.0f);
-            UpdateColorFromHSV(); InvalidateRect(hwnd, NULL, FALSE);
+            UpdateColorFromHSV();
+            // 只是点击时先直接更新 EDIT；真正拖动超过阈值后再切换到覆盖层。
+            UpdateEditBoxes(true);
+            InvalidateColorPreview(hwnd);
         }
         else if (x >= HUE_X && x <= HUE_X + HUE_W && y >= HUE_Y - 10 && y <= HUE_Y + HUE_H + 10) {
             dragHue = true; SetCapture(hwnd);
+            SetFocus(hwnd);
+            g_colorDragStart.x = x;
+            g_colorDragStart.y = y;
             int relX = max(0, min(HUE_W, x - HUE_X));
             currentH = (int)(((float)relX / HUE_W) * 360.0f);
             if (currentH >= 360) currentH = 359;
-            UpdateColorFromHSV(); InvalidateRect(hwnd, NULL, FALSE);
+            UpdateColorFromHSV();
+            UpdateEditBoxes(true);
+            InvalidateColorPreview(hwnd);
         }
         else if (x >= BTN_COPY_X && x <= BTN_COPY_X + BTN_COPY_W && y >= INPUT1_Y && y <= INPUT1_Y + BTN_COPY_H) {
             CopyToClipboard(hwnd, GetHexStr(currentR, currentG, currentB));
@@ -750,9 +1080,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_LBUTTONUP: {
+        if (dragSV || dragHue) {
+            if (g_showLiveValues) {
+                SetLiveValueMode(false);   // 拖动结束：写入最终值并重新显示 EDIT
+            }
+            else {
+                UpdateEditBoxes(true);     // 普通点击：EDIT 一直可见，刷新最终值
+            }
+        }
         dragSV = false; dragHue = false;
         isDraggingWindow = false;
         ReleaseCapture();
+        return 0;
+    }
+
+    case WM_CAPTURECHANGED: {
+        // 拖动过程中如果捕获被系统收走（例如 Alt+Tab），也要恢复输入框。
+        if (dragSV || dragHue) {
+            if (g_showLiveValues) {
+                SetLiveValueMode(false);
+            }
+            dragSV = false;
+            dragHue = false;
+        }
+        isDraggingWindow = false;
         return 0;
     }
 
@@ -766,6 +1117,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         PostQuitMessage(0);
         return 0;
+    }
+
+    case WM_NCDESTROY: {
+        // 子窗口此时已销毁，可以安全释放缓存资源。
+        ReleaseBackBuffer();
+        ReleaseUIFonts();
+        if (g_hIcon20) { DestroyIcon(g_hIcon20); g_hIcon20 = NULL; }
+        if (g_hIcon28) { DestroyIcon(g_hIcon28); g_hIcon28 = NULL; }
+        if (g_hEditFont) { DeleteObject(g_hEditFont); g_hEditFont = NULL; }
+        if (g_hEditBgBrush) { DeleteObject(g_hEditBgBrush); g_hEditBgBrush = NULL; }
+        return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -788,7 +1150,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     RegisterClassExW(&wcex);
 
     HWND hwnd = CreateWindowW(L"SuperColorPickerD2D", L"🎨 取色器",
-        WS_POPUP,
+        // WS_CLIPCHILDREN：父窗口绘制时裁剪掉两个 EDIT 子控件的区域。
+        // 否则拖动色板时整窗 BitBlt 会盖住输入框，造成高频闪烁。
+        WS_POPUP | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, WIN_W + 16, WIN_H + TITLE_H + 8, NULL, NULL, hInstance, NULL);
 
     ShowWindow(hwnd, nShowCmd);
